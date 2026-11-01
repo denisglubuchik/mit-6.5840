@@ -37,8 +37,8 @@ type WorkTask struct {
 	TaskNumber int
 
 	Filename string
-	NMap        int
-	NReduce        int
+	NMap     int
+	NReduce  int
 }
 
 type TaskDoneArgs struct {

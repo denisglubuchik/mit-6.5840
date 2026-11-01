@@ -10,9 +10,9 @@ type Lock struct {
 	// the specific Clerk type of ck but promises that ck supports
 	// Put and Get.  The tester passes the clerk in when calling
 	// MakeLock().
-	ck kvtest.IKVClerk
+	ck       kvtest.IKVClerk
 	lockname string
-	ownerID string
+	ownerID  string
 	// You may add code here
 }
 
@@ -32,11 +32,17 @@ func (lk *Lock) Acquire() {
 	key := lk.lockname
 	for {
 		val, ver, _ := lk.ck.Get(key)
+		if val == lk.ownerID {
+			return
+		}
 
 		if val == "" {
 			ok := lk.ck.Put(key, lk.ownerID, ver)
 			if ok == rpc.OK {
 				return
+			}
+			if ok == rpc.ErrVersion || ok == rpc.ErrMaybe {
+				continue
 			}
 		}
 	}
@@ -51,7 +57,7 @@ func (lk *Lock) Release() {
 	}
 	if lk.ownerID == val {
 		ok := lk.ck.Put(key, "", ver)
-		if ok == "" {
+		if ok == rpc.OK || ok == rpc.ErrMaybe {
 			return
 		}
 	}
