@@ -9,11 +9,13 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -95,6 +97,7 @@ func (rf *Raft) observeHigherTermLocked(term int) bool {
 	rf.currentTerm = term
 	rf.state = Follower
 	rf.votedFor = -1
+	rf.persist()
 	return true
 }
 
@@ -108,12 +111,17 @@ func (rf *Raft) observeHigherTermLocked(term int) bool {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	if e.Encode(rf.currentTerm) != nil ||
+		e.Encode(rf.votedFor) != nil ||
+		e.Encode(rf.log) != nil {
+		panic("cannot encode persisted Raft state")
+	}
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -121,19 +129,23 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("cannot decode persisted Raft state")
+	} else {
+		rf.mu.Lock()
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.log = log
+		rf.mu.Unlock()
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -195,6 +207,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.resetElectionTimerLocked()
+		rf.persist()
 	}
 
 }
@@ -243,6 +256,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -260,7 +276,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.state = Follower
 	rf.resetElectionTimerLocked()
 
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.XLen = len(rf.log)
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		xTerm := rf.log[args.PrevLogIndex].Term
+		xIndex := args.PrevLogIndex
+		for xIndex > 0 && rf.log[xIndex-1].Term == xTerm {
+			xIndex--
+		}
+		reply.XTerm = xTerm
+		reply.XIndex = xIndex
 		return
 	}
 
@@ -279,6 +307,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
+	rf.persist()
 
 	lastIndex := args.PrevLogIndex + len(args.Entries)
 
@@ -326,11 +355,6 @@ func (rf *Raft) replicateToPeer(peer int) {
 		lastLogIndex := len(rf.log) - 1
 		next := rf.nextIndex[peer]
 
-		if lastLogIndex < next {
-			rf.mu.Unlock()
-			return
-		}
-
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -351,6 +375,12 @@ func (rf *Raft) replicateToPeer(peer int) {
 		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
 			rf.observeHigherTermLocked(reply.Term)
+			rf.mu.Unlock()
+			return
+		}
+		if rf.state != Leader || rf.currentTerm != args.Term {
+			rf.mu.Unlock()
+			return
 		}
 		if reply.Success {
 			rf.matchIndex[peer] = lastLogIndex
@@ -360,7 +390,24 @@ func (rf *Raft) replicateToPeer(peer int) {
 			rf.mu.Unlock()
 			return
 		} else {
-			rf.nextIndex[peer]--
+			if reply.XLen > 0 {
+				rf.nextIndex[peer] = reply.XLen
+			} else {
+				foundIndex := -1
+				for i := lastLogIndex; i > 0; i-- {
+					if rf.log[i].Term == reply.XTerm {
+						foundIndex = i
+						break
+					}
+				}
+
+				if foundIndex != -1 {
+					rf.nextIndex[peer] = foundIndex + 1
+				} else {
+					rf.nextIndex[peer] = reply.XIndex
+				}
+
+			}
 		}
 		rf.mu.Unlock()
 	}
@@ -398,28 +445,7 @@ func (rf *Raft) broadcastHeartbeat() {
 			if peer == rf.me {
 				return
 			}
-			rf.mu.Lock()
-			prevLogIndex := rf.nextIndex[peer] - 1
-			args := AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  rf.log[prevLogIndex].Term,
-				Entries:      []LogEntry{},
-				LeaderCommit: rf.commitIndex,
-			}
-			rf.mu.Unlock()
-			var reply AppendEntriesReply
-			ok := rf.sendAppendEntries(peer, &args, &reply)
-			if !ok {
-				return
-			}
-
-			rf.mu.Lock()
-			if reply.Term > rf.currentTerm {
-				rf.observeHigherTermLocked(reply.Term)
-			}
-			rf.mu.Unlock()
+			rf.replicateToPeer(peer)
 		}(peer)
 	}
 }
@@ -453,6 +479,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.log) - 1
 	term = rf.currentTerm
 
+	rf.persist()
+
 	rf.mu.Unlock()
 
 	rf.broadcastAppendEntries()
@@ -467,6 +495,7 @@ func (rf *Raft) startElectionLocked() RequestVoteArgs {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.resetElectionTimerLocked()
+	rf.persist()
 
 	lastLogIndex := len(rf.log) - 1
 	return RequestVoteArgs{
