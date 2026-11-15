@@ -1,22 +1,42 @@
 package rsm
 
 import (
+	"crypto/rand"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
 
+type OpID [16]byte
+
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	ID  OpID
+	Me  int
+	Req any
 }
 
+type submitResult struct {
+	Err rpc.Err
+	Rep any
+}
+
+type waiter struct {
+	expectedID OpID
+	ch         chan submitResult
+}
+
+func newOpID() OpID {
+	var id OpID
+	if _, err := rand.Read(id[:]); err != nil {
+		panic(err)
+	}
+	return id
+}
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -38,6 +58,8 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+
+	waiters map[int]waiter
 }
 
 // servers[] contains the ports of the set of
@@ -61,17 +83,20 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		waiters:      make(map[int]waiter),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+
+	go rsm.reader()
+
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -83,5 +108,77 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	id := newOpID()
+	resultCh := make(chan submitResult, 1)
+
+	op := Op{Me: rsm.me, ID: id, Req: req}
+
+	rsm.mu.Lock()
+	startIndex, startTerm, isLeader := rsm.rf.Start(op)
+	if !isLeader {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+
+	rsm.waiters[startIndex] = waiter{
+		expectedID: id,
+		ch:         resultCh,
+	}
+	rsm.mu.Unlock()
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case result := <-resultCh:
+			return result.Err, result.Rep
+		case <-ticker.C:
+			currentTerm, isLeader := rsm.rf.GetState()
+			if currentTerm == startTerm && isLeader {
+				continue
+			}
+			rsm.mu.Lock()
+
+			waiter, exists := rsm.waiters[startIndex]
+			if exists && waiter.expectedID == id {
+				delete(rsm.waiters, startIndex)
+			}
+			rsm.mu.Unlock()
+			if exists && waiter.expectedID == id {
+				return rpc.ErrWrongLeader, nil
+			}
+		}
+	}
+
+}
+
+func (rsm *RSM) reader() {
+	for msg := range rsm.applyCh {
+		if !msg.CommandValid {
+			continue
+		}
+
+		op, ok := msg.Command.(Op)
+		if !ok {
+			continue
+		}
+		res := rsm.sm.DoOp(op.Req)
+
+		rsm.mu.Lock()
+
+		waiter, exists := rsm.waiters[msg.CommandIndex]
+		if exists {
+			delete(rsm.waiters, msg.CommandIndex)
+		}
+		rsm.mu.Unlock()
+
+		if exists {
+			if waiter.expectedID == op.ID {
+				waiter.ch <- submitResult{Err: rpc.OK, Rep: res}
+			} else {
+				waiter.ch <- submitResult{Err: rpc.ErrWrongLeader, Rep: nil}
+			}
+		}
+	}
 }
