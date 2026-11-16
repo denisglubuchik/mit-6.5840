@@ -34,7 +34,6 @@ const (
 
 const (
 	electionCheckInterval = 10 * time.Millisecond
-	applyInterval         = 10 * time.Millisecond
 	minElectionTimeout    = 400 * time.Millisecond
 	electionTimeoutJitter = 300 * time.Millisecond
 	heartbeatInterval     = 100 * time.Millisecond
@@ -49,6 +48,7 @@ type Raft struct {
 	state            RaftState
 	electionDeadline time.Time
 	applyCh          chan raftapi.ApplyMsg
+	applyCond        *sync.Cond
 
 	// persisted state
 	currentTerm       int
@@ -239,6 +239,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshot = append([]byte(nil), args.Data...)
 	rf.persist()
 	rf.snapshotPending = true
+
+	rf.applyCond.Signal()
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -365,6 +367,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, lastIndex)
+		rf.applyCond.Signal()
 	}
 
 	reply.Success = true
@@ -391,6 +394,7 @@ func (rf *Raft) updateCommitLocked() {
 		}
 		if count >= len(rf.peers)/2+1 {
 			rf.commitIndex = n
+			rf.applyCond.Signal()
 			break
 		}
 	}
@@ -699,8 +703,14 @@ func (rf *Raft) applier() {
 	for {
 		rf.mu.Lock()
 
+		for !rf.snapshotPending && rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+
+		var msg raftapi.ApplyMsg
+
 		if rf.snapshotPending {
-			msg := raftapi.ApplyMsg{
+			msg = raftapi.ApplyMsg{
 				SnapshotValid: true,
 				Snapshot:      append([]byte(nil), rf.snapshot...),
 				SnapshotTerm:  rf.termAt(rf.lastIncludedIndex),
@@ -710,29 +720,19 @@ func (rf *Raft) applier() {
 			rf.snapshotPending = false
 			rf.lastApplied = rf.lastIncludedIndex
 
-			rf.mu.Unlock()
-			rf.applyCh <- msg
+		} else {
+			rf.lastApplied++
+			index := rf.lastApplied
 
-			time.Sleep(applyInterval)
-			continue
+			msg = raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.logOffset(index)].Command,
+				CommandIndex: index,
+			}
 		}
-
-		if rf.lastApplied >= rf.commitIndex {
-			rf.mu.Unlock()
-			time.Sleep(applyInterval)
-			continue
-		}
-
-		rf.lastApplied++
-		index := rf.lastApplied
-		entry := rf.log[rf.logOffset(index)]
 
 		rf.mu.Unlock()
-		rf.applyCh <- raftapi.ApplyMsg{
-			CommandValid: true,
-			Command:      entry.Command,
-			CommandIndex: index,
-		}
+		rf.applyCh <- msg
 	}
 }
 
@@ -755,6 +755,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.log = []LogEntry{{Term: 0}}
 	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
