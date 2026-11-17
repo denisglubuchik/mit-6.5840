@@ -217,7 +217,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.state = Follower
 	rf.resetElectionTimerLocked()
 
-	if args.LastIncludedIndex <= rf.lastApplied {
+	if args.LastIncludedIndex <= rf.lastApplied ||
+       args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
 

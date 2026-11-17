@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 
@@ -73,12 +74,29 @@ func (kv *KVServer) DoOp(req any) any {
 }
 
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	if e.Encode(kv.storage) != nil {
+		panic("cannot encode storage")
+	}
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var storage map[string]Tvalue
+	if d.Decode(&storage) != nil {
+		panic("cannot decode storage")
+	}
+
+	kv.mu.Lock()
+	kv.storage = storage
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -114,7 +132,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
-	// You may need initialization code here.
 	return []any{kv, kv.rsm.Raft()}
 }
 

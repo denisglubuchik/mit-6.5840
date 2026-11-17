@@ -12,6 +12,8 @@ import (
 	"6.5840/tester1"
 )
 
+const snapshotThreshold = 0.9
+
 type OpID [16]byte
 
 type Op struct {
@@ -57,7 +59,6 @@ type RSM struct {
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
-	// Your definitions here.
 
 	waiters map[int]waiter
 }
@@ -88,6 +89,10 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
+	}
 
 	go rsm.reader()
 
@@ -102,12 +107,6 @@ func (rsm *RSM) Raft() raftapi.Raft {
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-
-	// Submit creates an Op structure to run a command through Raft;
-	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
-	// is the argument to Submit and id is a unique id for the op.
-
-	// your code here
 	id := newOpID()
 	resultCh := make(chan submitResult, 1)
 
@@ -153,8 +152,24 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 }
 
+func (rsm *RSM) snapshot(index int) {
+	raftBytes := rsm.rf.PersistBytes()
+
+	if rsm.maxraftstate == -1 || float32(raftBytes)/float32(rsm.maxraftstate) < snapshotThreshold {
+		return
+	}
+
+	snap := rsm.sm.Snapshot()
+	rsm.rf.Snapshot(index, snap)
+}
+
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh {
+		if msg.SnapshotValid {
+			rsm.sm.Restore(msg.Snapshot)
+			continue
+		}
+
 		if !msg.CommandValid {
 			continue
 		}
@@ -164,6 +179,8 @@ func (rsm *RSM) reader() {
 			continue
 		}
 		res := rsm.sm.DoOp(op.Req)
+
+		rsm.snapshot(msg.CommandIndex)
 
 		rsm.mu.Lock()
 
